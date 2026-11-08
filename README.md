@@ -1,3 +1,232 @@
+# libva-v4l2_request
+
+Backend pilote (**driver VA-API**) pour Linux permettant le décodage vidéo accéléré matériellement via l'API noyau **V4L2 Request API** (*stateless decoders*).
+
+---
+
+## 1. Qu'est-ce que ce dépôt et à quoi sert-il ?
+
+### Contexte technique
+Sous Linux, la plupart des lecteurs multimédias modernes (MPV, VLC, Chromium, Firefox, FFmpeg) exploitent l'API standard **VA-API** (*Video Acceleration API* via `libva`) pour déléguer le décodage vidéo au matériel.
+
+Cependant, de nombreux processeurs et SoCs (notamment ARM et Apple Silicon) intègrent des unités de traitement vidéo (VPU) dites **« stateless »** (sans état). Le pilote de ces puces dans le noyau Linux n'expose pas une interface avec état classique (*v4l2-m2m*), mais s'appuie sur la **V4L2 Request API** (`/dev/mediaX` et `/dev/videoX`). Les applications bureautiques ne savent généralement pas communiquer directement avec cette API noyau bas-niveau.
+
+### Rôle du projet
+`libva-v4l2_request` agit comme un **pont d'abstraction (shim driver)** :
+* Il fournit la bibliothèque partagée `v4l2_request_drv_video.so`.
+* Il traduit les commandes et structures de données standard émises par **VA-API** en requêtes conformes à la **V4L2 Request API**.
+* Il permet ainsi à n'importe quel logiciel compatible VA-API de bénéficier d'un décodage vidéo matériel transparent sur les puces supportées, réduisant drastiquement l'usage CPU et la consommation d'énergie.
+
+### Matériels et architectures cibles
+Ce pilote cible les processeurs pris en charge par les modules V4L2 stateless du noyau Linux :
+* **Allwinner** (moteur Cedrus : A64, H3, H5, H6, etc.)
+* **Rockchip** (rkvdec / Hantro : RK3399, RK3588, etc.)
+* **Apple Silicon** (M1/M2 sous Asahi Linux via le pilote noyau `apple-avd`)
+* **NXP i.MX** / **Amlogic** (avec pilotes V4L2 request compatibles)
+
+### Codecs pris en charge
+*(Selon les capacités matérielles du SoC et le support du pilote noyau associé)* :
+* **H.264 / AVC** (Constrained Baseline, Main, High)
+* **H.265 / HEVC** (Main profile, Main 10 selon SoC)
+* **VP9** (Profile 0 / Profile 2)
+* **AV1** (sur les SoCs récents comme le RK3588 ou Apple AVD)
+* **MPEG-2** (Simple et Main)
+
+---
+
+## 2. Pré-requis
+
+### A. Pré-requis noyau et matériel
+1. **Un noyau Linux récent** configuré avec le sous-système Media Controller et V4L2 Request API activés :
+   * `CONFIG_MEDIA_CONTROLLER=y`
+   * `CONFIG_MEDIA_CONTROLLER_REQUEST_API=y`
+   * `CONFIG_VIDEO_V4L2_SUBDEV_API=y`
+   * Les pilotes spécifiques à votre VPU activés (ex. `CONFIG_VIDEO_SUNXI_CEDRUS=m`, `CONFIG_VIDEO_ROCKCHIP_VDEC=m`, etc.).
+2. **Droits d'accès aux périphériques** :
+   Votre utilisateur doit appartenir aux groupes `video` et `render` afin d'accéder sans privilèges root à `/dev/media*`, `/dev/video*` et `/dev/dri/renderD*` :
+   ```bash
+   sudo usermod -aG video,render $USER
+   ```
+
+### B. Dépendances de compilation
+Sur une distribution de type Debian / Ubuntu / Armbian :
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    meson \
+    ninja-build \
+    pkg-config \
+    libva-dev \
+    libdrm-dev \
+    libudev-dev \
+    linux-headers-$(uname -r)
+```
+
+Sur Arch Linux ARM / Manjaro ARM :
+```bash
+sudo pacman -S --needed \
+    base-devel \
+    meson \
+    ninja \
+    pkgconf \
+    libva \
+    libdrm \
+    systemd-libs \
+    linux-headers
+```
+
+---
+
+## 3. Installation et Compilation
+
+### 1. Cloner le dépôt
+```bash
+git clone https://github.com/Trak-unixbased/libva-v4l2_request.git
+cd libva-v4l2_request
+```
+
+### 2. Configuration du build avec Meson
+Il est recommandé d'installer le pilote dans le préfixe système standard pour que `libva` le trouve automatiquement :
+```bash
+meson setup build --prefix=/usr --buildtype=release
+```
+
+*Note : Pour spécifier manuellement le répertoire des pilotes VA-API (si votre distribution utilise un chemin multi-arch particulier) :*
+```bash
+# Vérifier le dossier de recherche officiel de libva sur votre système :
+pkg-config --variable=driverdir libva
+
+# Exemple pour Debian/Ubuntu ARM64 :
+meson setup build --prefix=/usr --libdir=lib/aarch64-linux-gnu -Ddriverdir=/usr/lib/aarch64-linux-gnu/dri
+```
+
+### 3. Compilation
+```bash
+ninja -C build
+```
+
+### 4. Installation
+```bash
+sudo ninja -C build install
+```
+Cette commande installe le module binaire `v4l2_request_drv_video.so` dans le dossier dédié aux pilotes DRI / VA-API (généralement `/usr/lib/dri/` ou `/usr/lib/<triplet>/dri/`).
+
+---
+
+## 4. Configuration
+
+### A. Définition du pilote VA-API par défaut
+Par défaut, `libva` recherche un pilote correspondant au nom de la carte DRM (`mesa`, `panfrost`, `lima`, etc.). Il faut forcer l'usage du backend V4L2 Request via la variable d'environnement :
+
+```bash
+export LIBVA_DRIVER_NAME=v4l2_request
+```
+
+Pour rendre ce réglage persistant pour votre session, ajoutez cette ligne à `~/.bashrc`, `~/.profile` ou `/etc/environment`.
+
+### B. Spécification du chemin du pilote (optionnel)
+Si le pilote a été installé dans un chemin non standard :
+```bash
+export LIBVA_DRIVERS_PATH=/usr/lib/dri
+```
+
+### C. Sélection du périphérique média (si plusieurs VPU présents)
+Si votre machine possède plusieurs nœuds média et que le pilote ne sélectionne pas le bon automatiquement :
+```bash
+export LIBVA_V4L2_REQUEST_MEDIA_DEVICE=/dev/media0
+```
+
+---
+
+## 5. Validation et Mise en œuvre
+
+### Étape 1 : Vérification avec `vainfo`
+Installez l'utilitaire d'information VA-API :
+```bash
+# Debian/Ubuntu : sudo apt install vainfo
+# Arch Linux : sudo pacman -S libva-utils
+
+LIBVA_DRIVER_NAME=v4l2_request vainfo
+```
+
+**Sortie attendue (exemple indicatif) :**
+```text
+libva info: VA-API version: 1.20.0
+libva info: User environment variable requested driver 'v4l2_request'
+libva info: Trying to open /usr/lib/dri/v4l2_request_drv_video.so
+libva info: Found init function __vaDriverInit_1_20
+libva info: va_openDriver() returns 0
+vainfo: VA-API version: 1.20 (libva 2.20.0)
+vainfo: Driver version: v4l2_request driver
+vainfo: Supported profile and entrypoints
+      VAProfileH264ConstrainedBaseline: VAEntrypointVLD
+      VAProfileH264Main               : VAEntrypointVLD
+      VAProfileH264High               : VAEntrypointVLD
+      VAProfileHEVCMain               : VAEntrypointVLD
+```
+La mention `VAEntrypointVLD` confirme que le moteur de décodage matériel est opérationnel.
+
+---
+
+### Étape 2 : Lecture vidéo avec MPV
+`mpv` est le lecteur recommandé pour tester le rendu direct via DRM/KMS ou Wayland/X11 :
+
+```bash
+mpv --hwdec=vaapi --vo=gpu video_sample.mp4
+```
+
+*Sous Wayland avec rendu direct par dmabuf (zéro copie) :*
+```bash
+mpv --hwdec=vaapi --vo=dmabuf-wayland video_sample.mp4
+```
+Pendant la lecture, appuyez sur la touche `i` de votre clavier : la ligne `Decoder:` doit afficher `vaapi` ou `h264_vaapi` au lieu de `software`.
+
+---
+
+### Étape 3 : Décodage avec FFmpeg
+Pour tester la vitesse brute et vérifier l'absence d'erreurs de trames :
+```bash
+ffmpeg -hwaccel vaapi \
+       -hwaccel_device /dev/dri/renderD128 \
+       -hwaccel_output_format vaapi \
+       -i video_sample.mp4 \
+       -f null -
+```
+
+---
+
+### Étape 4 : Utilisation dans un navigateur (Chromium / Firefox)
+1. **Firefox** :
+   * Ouvrez `about:config`.
+   * Définissez `media.ffmpeg.vaapi.enabled` à `true`.
+   * Lancez le navigateur avec la variable définie : `LIBVA_DRIVER_NAME=v4l2_request firefox`.
+2. **Chromium** :
+   ```bash
+   LIBVA_DRIVER_NAME=v4l2_request chromium --enable-features=VaapiVideoDecoder --use-gl=egl
+   ```
+
+---
+
+## 6. Dépannage et Résolution des problèmes
+
+| Symptôme | Cause probable | Solution |
+| :--- | :--- | :--- |
+| `va_openDriver() returns -1` | Le fichier `.so` est introuvable ou mal positionné. | Vérifier le chemin avec `ls $(pkg-config --variable=driverdir libva)/v4l2_request_drv_video.so`. Définir `LIBVA_DRIVERS_PATH`. |
+| `Permission denied` sur `/dev/mediaX` | Droits insuffisants. | Ajouter l'utilisateur aux groupes `video` et `render`, puis redémarrer la session. |
+| Écran vert ou trames corrompues | Décalage de format (NV12 vs formats tuilés matériels) ou bug de synchronisation GPU. | Tester une sortie vidéo alternative avec mpv (`--vo=gpu` avec OpenGL plutôt que Vulkan). |
+| `Could not create device` / `v4l2-request: no decoder found` | Le module du noyau pour le décodeur n'est pas chargé. | Vérifier avec `v4l2-ctl --list-devices` et `dmesg \| grep -iE 'cedrus\|rkvdec\|hantro\|avd'`. |
+
+### Activer les journaux détaillés pour le débogage :
+```bash
+LIBVA_MESSAGING_LEVEL=2 LIBVA_DRIVER_NAME=v4l2_request vainfo
+```
+
+---
+
+## 7. Licence
+
+Ce projet est distribué sous licence libre (généralement **GPL-3.0-or-later** ou **LGPL-2.1-or-later** selon les composants issus du travail amont de Bootlin et Ondřej Jirman). Consultez le fichier `COPYING` ou `LICENSE` pour plus de précisions.
 # libva-v4l2
 
 A VA-API backend for V4L2 stateful M2M codecs. It provides hardware video decoding and
