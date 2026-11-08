@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,12 +14,25 @@ STARTUP_UNAVAILABLE = re.compile(
     r'^(?:FATAL: ThreadSanitizer: unexpected memory mapping [^\n]+|'
     r'FATAL: ThreadSanitizer: unsupported VMA range[^\n]*|'
     r'FATAL: ThreadSanitizer: memory layout is incompatible[^\n]*)$', re.M)
+# The probe also blocks in pthread_cond_wait: TSan intercepts it through
+# call_pthread_cancel_with_cleanup(), whose sigsetjmp interceptor tail-jumps
+# into libc with "br x2". On aarch64 with a BTI-enforcing glibc (Ubuntu
+# 26.04, GCC 15 libtsan) that indirect branch lands on libc's "bti c" pad and
+# dies with SIGILL before any schedule runs, which is a runtime defect and not
+# a race in the driver. main() holds the mutex while creating the thread, so
+# the wait is always entered.
 PROBE = '''#include <pthread.h>
 #include <stdatomic.h>
 static atomic_int shared;
-static void *fn(void *p) { shared++; return p; }
-int main(void) { pthread_t t; if (pthread_create(&t, 0, fn, 0)) return 1;
-return pthread_join(t, 0); }
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+static int ready;
+static void *fn(void *p) { shared++; pthread_mutex_lock(&lock); ready = 1;
+pthread_cond_signal(&cond); pthread_mutex_unlock(&lock); return p; }
+int main(void) { pthread_t t; pthread_mutex_lock(&lock);
+if (pthread_create(&t, 0, fn, 0)) return 1;
+while (!ready) pthread_cond_wait(&cond, &lock);
+pthread_mutex_unlock(&lock); return pthread_join(t, 0); }
 '''
 
 def probe_status(code, output):
@@ -27,6 +41,10 @@ def probe_status(code, output):
     # A diagnostic alongside a startup line must not become a skip.
     if 'WARNING: ThreadSanitizer' in output or 'SUMMARY: ThreadSanitizer' in output:
         return 1
+    # A race-free probe killed by SIGILL means the TSan runtime itself cannot
+    # run here (aarch64 BTI fault in its sigsetjmp interceptor).
+    if code == -signal.SIGILL:
+        return 77
     lines = [line for line in output.splitlines() if line.strip()]
     if lines and all(STARTUP_UNAVAILABLE.fullmatch(line) for line in lines):
         return 77
@@ -55,6 +73,9 @@ def self_test():
     assert probe_status(66, 'FATAL: ThreadSanitizer: unknown failure\n') == 1
     assert probe_status(66, 'WARNING: ThreadSanitizer: data race\n') == 1
     assert probe_status(66, 'FATAL: ThreadSanitizer: unexpected memory mapping 0x1-0x2\nSUMMARY: ThreadSanitizer: data race\n') == 1
+    assert probe_status(-signal.SIGILL, '') == 77
+    assert probe_status(-signal.SIGILL, 'WARNING: ThreadSanitizer: data race\n') == 1
+    assert probe_status(-signal.SIGSEGV, '') == 1
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         compiler = work / 'fake compiler.py'
@@ -78,6 +99,9 @@ def main():
         status = probe(compiler, work)
         if status:
             print('concurrent-tsan: %s (runtime/toolchain probe)' % ('SKIP' if status == 77 else 'FAIL'))
+            if status == 77:
+                print('concurrent-tsan: the ThreadSanitizer runtime cannot run on this host '
+                      '(e.g. aarch64 BTI fault in libtsan); no driver race was tested')
             return status
         build = work / 'build'
         env = dict(os.environ, CC=' '.join(shlex.quote(arg) for arg in compiler), TSAN_OPTIONS='halt_on_error=1:exitcode=66')

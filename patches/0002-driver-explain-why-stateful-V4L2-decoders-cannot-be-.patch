@@ -1,0 +1,44 @@
+From 8b419b4497446e897d3f9e4c908a01b6f75dbcf9 Mon Sep 17 00:00:00 2001
+From: Olivier Pavilla <olivier.pavilla@gmail.com>
+Date: Sun, 8 Nov 2026 14:49:26 +0100
+Subject: [PATCH 2/5] driver: explain why stateful V4L2 decoders cannot be used
+
+When no Request API decoder is found, add a diagnostic stating that
+stateful mem2mem decoders (Arm Linlon MVE/mvx on CIX CD8180 Sky1,
+Qualcomm venus/iris, NXP Amphion) are not supported and that V4L2 M2M
+decoding in FFmpeg/GStreamer should be used there. No extra device is
+opened for this, since some vendor ISP nodes misbehave when probed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FQfobs28ekFzBoyDd2gygv
+---
+ src/driver.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/driver.c b/src/driver.c
+index 71d3924..71ea06f 100644
+--- a/src/driver.c
++++ b/src/driver.c
+@@ -1133,6 +1133,19 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
+ 	if (!drv->nb_decoders) {
+ 		v4l2r_diag(NULL, V4L2R_DIAG_LEVEL_ERROR, V4L2R_DIAG_UNSUPPORTED,
+ 			   "driver-init", 0, "no V4L2 Request API decoder found");
++		/*
++		 * Many SoCs only have a stateful decoder whose firmware parses
++		 * the bitstream (Arm Linlon MVE "mvx" on the CIX CD8180/Sky1 of
++		 * the Orange Pi 6 Plus, Qualcomm venus/iris, NXP Amphion...).
++		 * Say why VA-API cannot work there. No device is opened for
++		 * this: some vendor ISP nodes misbehave when probed.
++		 */
++		v4l2r_diag(NULL, V4L2R_DIAG_LEVEL_ERROR, V4L2R_DIAG_UNSUPPORTED,
++			   "stateless-required", 0,
++			   "this driver needs a stateless (Request API) decoder; "
++			   "stateful V4L2 decoders such as Arm Linlon/mvx (CIX Sky1), "
++			   "Qualcomm venus/iris or NXP Amphion are not supported, "
++			   "use FFmpeg/GStreamer V4L2 M2M decoding on those");
+ 		v4l2r_Terminate(va_ctx);
+ 		return VA_STATUS_ERROR_OPERATION_FAILED;
+ 	}
+-- 
+2.43.0
+

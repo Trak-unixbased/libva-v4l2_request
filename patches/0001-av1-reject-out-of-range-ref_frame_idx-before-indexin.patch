@@ -1,0 +1,169 @@
+From 02b381a5270a25a7e25195d4bd03283fc7fc462c Mon Sep 17 00:00:00 2001
+From: Olivier Pavilla <olivier.pavilla@gmail.com>
+Date: Sun, 8 Nov 2026 14:49:26 +0100
+Subject: [PATCH 1/5] av1: reject out-of-range ref_frame_idx before indexing
+ the DPB
+
+VA-API passes ref_frame_idx as uint8_t but struct v4l2_ctrl_av1_frame
+stores it as __s8. A client value >= 128 became negative, passed the
+"< 8" check in av1_validate_primary() and read reference_frame_ts[]
+before the array (UBSan: codec_av1.c:854 index out of bounds). The
+kernel does not range-check these indices either.
+
+Add av1_ref_slot() which reinterprets the byte as unsigned, reject any
+inter frame whose ref_frame_idx[] leaves the 8-slot DPB, and print the
+indices unsigned in the trace. Add the av1-reftrace slot-negative case
+(ref_frame_idx = 200), which fails under UBSan without this fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FQfobs28ekFzBoyDd2gygv
+---
+ src/codec_av1.c      | 56 ++++++++++++++++++++++++++++++++++----------
+ tests/av1-reftrace.c |  9 +++++--
+ tests/meson.build    |  2 +-
+ 3 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/src/codec_av1.c b/src/codec_av1.c
+index e8076ee..e16287d 100644
+--- a/src/codec_av1.c
++++ b/src/codec_av1.c
+@@ -725,6 +725,24 @@ static uint8_t av1_fallback_refresh(const struct av1_context *codec)
+ 	return (uint8_t)~referenced;
+ }
+ 
++/*
++ * DPB slot named by ref_frame_idx[i], or -1 when it is out of range.
++ * VA-API transports ref_frame_idx as uint8_t but the V4L2 control stores it
++ * as __s8: a client value >= 128 turns negative and would pass a plain
++ * "< 8" test, then index reference_frame_ts[] before the array. Reinterpret
++ * the byte as unsigned so every out-of-range value is rejected.
++ */
++static int av1_ref_slot(const struct v4l2_ctrl_av1_frame *frame, unsigned int i)
++{
++	uint8_t slot;
++
++	if (i >= V4L2_AV1_REFS_PER_FRAME)
++		return -1;
++
++	slot = (uint8_t)frame->ref_frame_idx[i];
++	return slot < V4L2_AV1_TOTAL_REFS_PER_FRAME ? (int)slot : -1;
++}
++
+ /* Trace client controls and queue outcome, not the kernel's reference lookup. */
+ static void av1_trace_pending(struct v4l2r_context *ctx, VAStatus status)
+ {
+@@ -741,11 +759,9 @@ static void av1_trace_pending(struct v4l2r_context *ctx, VAStatus status)
+ 	    (frame->flags & V4L2_AV1_FRAME_FLAG_ERROR_RESILIENT_MODE) ||
+ 	    frame->primary_ref_frame == 7)
+ 		cdf = "default";
+-	else if (frame->primary_ref_frame < 7 &&
+-		 frame->ref_frame_idx[frame->primary_ref_frame] < 8) {
++	else if ((slot = av1_ref_slot(frame, frame->primary_ref_frame)) >= 0)
+ 		cdf = "reference";
+-		slot = frame->ref_frame_idx[frame->primary_ref_frame];
+-	} else
++	else
+ 		cdf = "invalid";
+ 
+ 	v4l2r_trace("AV1 job ctx=%u job=%" PRIu64
+@@ -767,10 +783,10 @@ static void av1_trace_pending(struct v4l2r_context *ctx, VAStatus status)
+ 	v4l2r_trace("AV1 refs ctx=%u job=%" PRIu64
+ 		    " idx=%u,%u,%u,%u,%u,%u,%u hints=%u,%u,%u,%u,%u,%u,%u\n",
+ 		    ctx->diag_serial, codec->pend_job,
+-		    frame->ref_frame_idx[0], frame->ref_frame_idx[1],
+-		    frame->ref_frame_idx[2], frame->ref_frame_idx[3],
+-		    frame->ref_frame_idx[4], frame->ref_frame_idx[5],
+-		    frame->ref_frame_idx[6], frame->order_hints[1],
++		    (uint8_t)frame->ref_frame_idx[0], (uint8_t)frame->ref_frame_idx[1],
++		    (uint8_t)frame->ref_frame_idx[2], (uint8_t)frame->ref_frame_idx[3],
++		    (uint8_t)frame->ref_frame_idx[4], (uint8_t)frame->ref_frame_idx[5],
++		    (uint8_t)frame->ref_frame_idx[6], frame->order_hints[1],
+ 		    frame->order_hints[2], frame->order_hints[3],
+ 		    frame->order_hints[4], frame->order_hints[5],
+ 		    frame->order_hints[6], frame->order_hints[7]);
+@@ -842,16 +858,30 @@ static VAStatus av1_validate_primary(struct v4l2r_context *ctx)
+ {
+ 	const struct av1_context *codec = ctx->codec_priv;
+ 	const struct v4l2_ctrl_av1_frame *frame = &codec->frame;
++	int slot;
+ 
+ 	if (frame->frame_type == V4L2_AV1_KEY_FRAME ||
+-	    frame->frame_type == V4L2_AV1_INTRA_ONLY_FRAME ||
+-	    (frame->flags & V4L2_AV1_FRAME_FLAG_ERROR_RESILIENT_MODE) ||
++	    frame->frame_type == V4L2_AV1_INTRA_ONLY_FRAME)
++		return VA_STATUS_SUCCESS;
++
++	/* Inter frames hand every ref_frame_idx to the kernel, which uses them
++	 * as DPB indices without range-checking them itself. */
++	for (unsigned int i = 0; i < V4L2_AV1_REFS_PER_FRAME; i++) {
++		if (av1_ref_slot(frame, i) < 0) {
++			v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_WARNING,
++				   V4L2R_DIAG_REFERENCE, "av1-reference-index", 0,
++				   "AV1 ref_frame_idx[%u]=%u is outside the 8-slot DPB",
++				   i, (unsigned int)(uint8_t)frame->ref_frame_idx[i]);
++			return VA_STATUS_ERROR_INVALID_BUFFER;
++		}
++	}
++
++	if ((frame->flags & V4L2_AV1_FRAME_FLAG_ERROR_RESILIENT_MODE) ||
+ 	    frame->primary_ref_frame == 7)
+ 		return VA_STATUS_SUCCESS;
+ 
+-	if (frame->primary_ref_frame < 7 &&
+-	    frame->ref_frame_idx[frame->primary_ref_frame] < 8 &&
+-	    frame->reference_frame_ts[frame->ref_frame_idx[frame->primary_ref_frame]])
++	slot = av1_ref_slot(frame, frame->primary_ref_frame);
++	if (slot >= 0 && frame->reference_frame_ts[slot])
+ 		return VA_STATUS_SUCCESS;
+ 
+ 	v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_WARNING, V4L2R_DIAG_REFERENCE,
+diff --git a/tests/av1-reftrace.c b/tests/av1-reftrace.c
+index 33c428a..111749c 100644
+--- a/tests/av1-reftrace.c
++++ b/tests/av1-reftrace.c
+@@ -285,7 +285,8 @@ static void admission_case(const char *name)
+ {
+     bool reject = !strcmp(name, "required-missing") || !strcmp(name, "required-foreign") ||
+                   !strcmp(name, "required-failed") || !strcmp(name, "required-detached") ||
+-                  !strcmp(name, "primary-bounds") || !strcmp(name, "slot-bounds");
++                  !strcmp(name, "primary-bounds") || !strcmp(name, "slot-bounds") ||
++                  !strcmp(name, "slot-negative");
+     picture(0, 0, 0);
+     assert(assemble() == VA_STATUS_SUCCESS && !requests_queued);
+     picture(1, 1, 4);
+@@ -308,6 +309,9 @@ static void admission_case(const char *name)
+     }
+     if (!strcmp(name, "primary-bounds")) pic.primary_ref_frame = 8;
+     if (!strcmp(name, "slot-bounds")) pic.ref_frame_idx[1] = 8;
++    /* VA-API carries uint8_t, V4L2 stores __s8: 200 becomes -56 and must not
++     * index reference_frame_ts[] before the array. */
++    if (!strcmp(name, "slot-negative")) pic.ref_frame_idx[1] = 200;
+     if (!strcmp(name, "key-default")) {
+         pic.pic_info_fields.bits.frame_type = 0;
+         pic.ref_frame_map[3] = VA_INVALID_SURFACE;
+@@ -399,7 +403,8 @@ int main(int argc, char **argv)
+     assert(dup2(fileno(sink), STDERR_FILENO) == STDERR_FILENO);
+     setup();
+     if (!strncmp(argv[1], "required-", 9) || !strcmp(argv[1], "primary-bounds") ||
+-        !strcmp(argv[1], "slot-bounds") || !strcmp(argv[1], "valid-primary") ||
++        !strcmp(argv[1], "slot-bounds") || !strcmp(argv[1], "slot-negative") ||
++        !strcmp(argv[1], "valid-primary") ||
+         !strcmp(argv[1], "key-default") || !strcmp(argv[1], "intra-default") ||
+         !strcmp(argv[1], "resilient-default") || !strcmp(argv[1], "none-default")) {
+         admission_case(argv[1]);
+diff --git a/tests/meson.build b/tests/meson.build
+index 78bd6d6..d39a645 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -390,7 +390,7 @@ if conf.get('HAVE_V4L2_CTRL_AV1') == 1
+   endforeach
+   foreach case : ['basic', 'default', 'default-missing', 'default-foreign', 'failure',
+                   'required-missing', 'required-foreign', 'required-failed', 'required-detached',
+-                  'primary-bounds', 'slot-bounds', 'valid-primary', 'key-default',
++                  'primary-bounds', 'slot-bounds', 'slot-negative', 'valid-primary', 'key-default',
+                   'intra-default', 'resilient-default', 'none-default']
+     foreach tracing : ['on', 'off']
+       test('av1-reftrace-' + case + '-' + tracing, av1_reftrace,
+-- 
+2.43.0
+

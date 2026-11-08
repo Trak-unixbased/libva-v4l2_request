@@ -1979,7 +1979,10 @@ static void run_rep(void)
     atomic_store_explicit(&rep_done, true, memory_order_release);
     assert(pthread_join(threads[0], NULL) == 0);
 
-    for (unsigned i = 0; i < rep.n_streams; i++) {
+    /* main() rejects n_streams > MAX_STREAMS; the explicit bound only
+     * keeps GCC >= 14 at -O2 from assuming an index past streams[] after
+     * the thread calls above (false -Wstringop-overflow on this load). */
+    for (unsigned i = 0; i < rep.n_streams && i < MAX_STREAMS; i++) {
         struct stream *s = &rep.streams[i];
 
         assert(atomic_load(&s->teardown_completed));

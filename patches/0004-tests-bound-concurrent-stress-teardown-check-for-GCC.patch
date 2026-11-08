@@ -1,0 +1,37 @@
+From aee32fed3376b899095e86000220fbe0d06362f4 Mon Sep 17 00:00:00 2001
+From: Olivier Pavilla <olivier.pavilla@gmail.com>
+Date: Sun, 8 Nov 2026 15:46:20 +0100
+Subject: [PATCH 4/5] tests: bound concurrent-stress teardown check for GCC >=
+ 14
+
+GCC 14/15 at -O2 (meson --buildtype=release, e.g. Ubuntu 26.04 aarch64
+gcc 15.2) warns -Wstringop-overflow on the final teardown_completed
+load in run_rep(): after the pthread calls it can no longer prove
+rep.n_streams <= MAX_STREAMS, although main() already rejects larger
+values. Bound the loop explicitly. No behaviour change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FQfobs28ekFzBoyDd2gygv
+---
+ tests/concurrent-stress.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tests/concurrent-stress.c b/tests/concurrent-stress.c
+index 880ae92..dd99354 100644
+--- a/tests/concurrent-stress.c
++++ b/tests/concurrent-stress.c
+@@ -1979,7 +1979,10 @@ static void run_rep(void)
+     atomic_store_explicit(&rep_done, true, memory_order_release);
+     assert(pthread_join(threads[0], NULL) == 0);
+ 
+-    for (unsigned i = 0; i < rep.n_streams; i++) {
++    /* main() rejects n_streams > MAX_STREAMS; the explicit bound only
++     * keeps GCC >= 14 at -O2 from assuming an index past streams[] after
++     * the thread calls above (false -Wstringop-overflow on this load). */
++    for (unsigned i = 0; i < rep.n_streams && i < MAX_STREAMS; i++) {
+         struct stream *s = &rep.streams[i];
+ 
+         assert(atomic_load(&s->teardown_completed));
+-- 
+2.43.0
+
